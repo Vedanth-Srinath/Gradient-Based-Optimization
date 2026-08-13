@@ -1,0 +1,16 @@
+# large binaries — never commit
+data/*.mat
+models/*.pth
+models/*.pt
+results/*.mat
+results/*.npz
+validation/third_party/
+!results/.gitkeep
+
+# python / notebook
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
