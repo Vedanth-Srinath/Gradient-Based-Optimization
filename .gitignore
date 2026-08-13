@@ -13,4 +13,5 @@ __pycache__/
 .ipynb_checkpoints/
 
 # macOS
-.DS_Store
+.DS_Storeanaconda_projects/
+.ipynb_checkpoints/
