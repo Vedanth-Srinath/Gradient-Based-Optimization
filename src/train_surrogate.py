@@ -64,7 +64,18 @@ def run(args):
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-    loss_fn = nn.MSELoss()
+    # Deep-weighted MSE: upweight the rare deep-resonance points (true dB < thr)
+    # so the surrogate is accurate where the GD targets live. With
+    # --deep_weight 0 this is identical to plain MSE. Weights use the TRUE dB
+    # (via the normalizer), so the threshold is in real dB, not normalized units.
+    def weighted_mse(pred, y):
+        if args.deep_weight <= 0:
+            return ((pred - y) ** 2).mean()
+        y_db = norm.to_db(y)                       # differentiable, dB space
+        w = 1.0 + args.deep_weight * (y_db < args.deep_thr).float()
+        return (w * (pred - y) ** 2).mean()
+
+    loss_fn = weighted_mse
 
     os.makedirs(args.ckpt_dir, exist_ok=True)
     last_path = os.path.join(args.ckpt_dir, f"seed{args.seed}_last.pth")
@@ -105,7 +116,9 @@ def run(args):
         with torch.no_grad():
             for xb, yb in val_loader:
                 xb, yb = xb.to(device), yb.to(device)
-                vrun += loss_fn(model(xb), yb).item() * xb.size(0)
+                # validation stays PLAIN MSE so val is comparable across
+                # different --deep_weight settings (best.pth selection is fair).
+                vrun += ((model(xb) - yb) ** 2).mean().item() * xb.size(0)
         val_mse = vrun / len(ds.val)
 
         ck = {"model": model.state_dict(), "opt": opt.state_dict(),
@@ -173,6 +186,11 @@ def get_args():
     p.add_argument("--batch", type=int, default=256)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--dropout", type=float, default=0.1)
+    p.add_argument("--deep_weight", type=float, default=0.0,
+                   help="extra weight on points with true dB < deep_thr "
+                        "(0 = plain MSE; try 10-30 to fix the deep-region blind spot)")
+    p.add_argument("--deep_thr", type=float, default=-10.0,
+                   help="dB threshold defining 'deep resonance' samples")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--split_seed", type=int, default=0,
                    help="keep fixed across seeds so the test set never changes")
