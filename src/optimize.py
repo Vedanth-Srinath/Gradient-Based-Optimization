@@ -116,14 +116,46 @@ def optimize_target(
     return result
 
 
+def save_result_mat(path, design_12x12, s11_db_81, target_f_ghz, target_d_db):
+    """Write ONE design in the exact format the TNN MATLAB validator reads:
+       pred_antenna_rec (12x12), pred_spec_rec (81x1 dB),
+       target_freq_GHz, target_depth_dB.
+    """
+    import scipy.io
+    scipy.io.savemat(path, {
+        "pred_antenna_rec": design_12x12.astype(np.float64),
+        "pred_spec_rec": np.asarray(s11_db_81, dtype=np.float64).reshape(-1, 1),
+        "target_freq_GHz": float(target_f_ghz),
+        "target_depth_dB": float(target_d_db),
+    })
+
+
+def detect_feed_from_data(data_path, device, thresh=0.99, max_n=20000):
+    """Load a chunk of the dataset and infer fixed feed pixels."""
+    import scipy.io
+    from projection import detect_feed_pixels
+    X = scipy.io.loadmat(data_path)["XTrain1"][:max_n]
+    mask_np = detect_feed_pixels(X, thresh=thresh)
+    n = int(mask_np.sum())
+    print(f"feed pixels detected: {n} at {list(zip(*np.where(mask_np)))}")
+    if n == 0 or n > 8:
+        print("  WARNING: feed detection looks off (expected ~1-4 pixels). "
+              "Check orientation / thresh before trusting designs.")
+    return torch.from_numpy(mask_np).to(device)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt", default="models/seed0_best.pth")
-    p.add_argument("--center_ghz", type=float, nargs="+", default=[15.0])
-    p.add_argument("--target_db", type=float, default=-8.0)
+    p.add_argument("--data", default=None,
+                   help="dataset path; if given, feed pixels are detected and fixed")
+    p.add_argument("--out_dir", default="results/gd_designs")
+    p.add_argument("--freqs", type=float, nargs="+", default=[15.0])
+    p.add_argument("--depths", type=float, nargs="+", default=[-8.0])
     p.add_argument("--stop_floor_db", type=float, default=-2.0)
-    p.add_argument("--restarts", type=int, default=64)
-    p.add_argument("--iters", type=int, default=300)
+    p.add_argument("--half_pass", type=int, default=3)
+    p.add_argument("--restarts", type=int, default=128)
+    p.add_argument("--iters", type=int, default=600)
     p.add_argument("--gamma", type=float, default=0.0, help="L_trust weight (0=off)")
     args = p.parse_args()
 
@@ -131,18 +163,40 @@ def main():
                           else "mps" if getattr(torch.backends, "mps", None)
                           and torch.backends.mps.is_available() else "cpu")
     model, norm = load_surrogate(args.ckpt, device)
-    centers = [ghz_to_bin(g) for g in args.center_ghz]
-    print(f"device={device}  centers(GHz)={[round(bin_to_ghz(c),2) for c in centers]}")
+    print(f"device={device}")
 
-    r = optimize_target(model, norm, centers, device,
-                        target_db=args.target_db, stop_floor_db=args.stop_floor_db,
-                        restarts=args.restarts, iters=args.iters, gamma=args.gamma)
-    passband_db = r["best_s11_db"][r["pass_mask"]]
-    print(f"best projected spec-loss : {r['best_proj_score']:.4f}")
-    print(f"best soft spec-loss      : {r['best_soft_score']:.4f}")
-    print(f"projection gap (mean)    : {r['projection_gap']:.4f}")
-    print(f"passband S11 (dB) min/max: {passband_db.min():.2f} / {passband_db.max():.2f}")
-    print(f"target was <= {args.target_db} dB in passband")
+    feed_mask = None
+    if args.data:
+        feed_mask = detect_feed_from_data(args.data, device)
+    else:
+        print("WARNING: no --data given -> feed pixels NOT fixed. Designs may be "
+              "out-of-distribution for the surrogate and invalid antennas. "
+              "Pass --data for valid results.")
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    print(f"\n{'target':>16}  {'surr_dip_dB':>11}  {'proj_gap':>8}  file")
+    summary = []
+    for f_ghz in args.freqs:
+        for d_db in args.depths:
+            centers = [ghz_to_bin(f_ghz)]
+            r = optimize_target(
+                model, norm, centers, device,
+                target_db=d_db, stop_floor_db=args.stop_floor_db,
+                half_pass=args.half_pass, restarts=args.restarts,
+                iters=args.iters, gamma=args.gamma, feed_mask=feed_mask,
+            )
+            pm = r["pass_mask"]
+            surr_dip = float(r["best_s11_db"][pm].min())
+            fname = f"pred_rec_f{int(f_ghz)}_d{int(d_db)}.mat"
+            fpath = os.path.join(args.out_dir, fname)
+            save_result_mat(fpath, r["best_design"], r["best_s11_db"], f_ghz, d_db)
+            print(f"{f_ghz:6.0f}GHz/{d_db:5.0f}dB  {surr_dip:11.2f}  "
+                  f"{r['projection_gap']:8.3f}  {fname}")
+            summary.append((f_ghz, d_db, surr_dip, r["projection_gap"]))
+
+    print(f"\nSaved {len(summary)} designs to {args.out_dir}")
+    print("Next: download that folder to your Mac, point baseline_dir at it, "
+          "run your TNN MATLAB validator to get EM-vs-surrogate plots.")
 
 
 if __name__ == "__main__":
