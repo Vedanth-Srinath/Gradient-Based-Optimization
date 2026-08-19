@@ -66,7 +66,7 @@ def optimize_target(
     restarts=64, iters=300, lr=0.1,
     k_min=1.0, k_max=15.0,
     beta_max=2.0, gamma=0.0, trust_K=8,
-    feed_mask=None, seed=0,
+    feed_mask=None, seed=0, warm_init=None, warm_frac=0.5,
 ):
     torch.manual_seed(seed)
     pm_np, sm_np = make_masks(centers, half_pass=half_pass, guard=guard)
@@ -75,7 +75,23 @@ def optimize_target(
     if feed_mask is not None:
         feed_mask = feed_mask.to(device)
 
-    theta = (0.1 * torch.randn(restarts, 1, 12, 12, device=device)).requires_grad_(True)
+    # Initialize logits. Random by default; if warm_init designs are given,
+    # seed a fraction of restarts FROM those real designs (mapped to logits)
+    # so GD refines shapes the surrogate already predicts well, instead of
+    # inventing out-of-distribution geometry. warm_init: (M,12,12) binary array.
+    theta = 0.1 * torch.randn(restarts, 1, 12, 12, device=device)
+    if warm_init is not None and len(warm_init) > 0:
+        n_warm = int(round(restarts * warm_frac))
+        wi = torch.as_tensor(warm_init, dtype=torch.float32, device=device)  # (M,12,12)
+        idx = torch.randint(0, wi.shape[0], (n_warm,), device=device)
+        seed_designs = wi[idx]                                  # (n_warm,12,12)
+        # binary {0,1} -> logits: 1 -> +3, 0 -> -3 (tanh(k*3) ~ binary at low k),
+        # plus small noise so the n_warm restarts aren't identical.
+        seed_logits = (seed_designs * 2.0 - 1.0) * 3.0
+        seed_logits = seed_logits.unsqueeze(1)                  # (n_warm,1,12,12)
+        seed_logits = seed_logits + 0.3 * torch.randn_like(seed_logits)
+        theta[:n_warm] = seed_logits
+    theta = theta.requires_grad_(True)
     opt = torch.optim.Adam([theta], lr=lr)
 
     for step in range(iters):
@@ -130,6 +146,32 @@ def save_result_mat(path, design_12x12, s11_db_81, target_f_ghz, target_d_db):
     })
 
 
+def load_warm_designs(data_path, center_bin, device, tol_bins=3, depth_max=-6.0, cap=200):
+    """Find real dataset designs whose S11 dips near `center_bin`.
+
+    Returns up to `cap` binary (M,12,12) designs whose minimum S11 in the window
+    [center_bin +/- tol_bins] is below depth_max (dB). These are in-distribution
+    shapes that already resonate near the target -> good GD starting points.
+    """
+    import scipy.io
+    d = scipy.io.loadmat(data_path)
+    X = d["XTrain1"]                      # (N,1,12,12) uint8
+    Y = d["YTrain"]                       # (81,N) dB
+    lo = max(0, center_bin - tol_bins)
+    hi = min(Y.shape[0] - 1, center_bin + tol_bins)
+    window_min = Y[lo:hi + 1, :].min(axis=0)          # (N,) deepest dip near target
+    sel = np.where(window_min < depth_max)[0]
+    if len(sel) == 0:
+        print(f"  warm-start: no dataset design dips < {depth_max} dB near bin "
+              f"{center_bin}; falling back to random init.")
+        return None
+    if len(sel) > cap:
+        sel = np.random.default_rng(0).choice(sel, cap, replace=False)
+    designs = X[sel, 0].astype(np.float32)            # (M,12,12)
+    print(f"  warm-start: {len(sel)} dataset designs resonate near bin {center_bin}")
+    return designs
+
+
 def detect_feed_from_data(data_path, device, thresh=0.99, max_n=20000):
     """Load a chunk of the dataset and infer fixed feed pixels."""
     import scipy.io
@@ -157,6 +199,11 @@ def main():
     p.add_argument("--restarts", type=int, default=128)
     p.add_argument("--iters", type=int, default=600)
     p.add_argument("--gamma", type=float, default=0.0, help="L_trust weight (0=off)")
+    p.add_argument("--warm_start", action="store_true",
+                   help="seed a fraction of restarts from real dataset designs "
+                        "that resonate near the target (needs --data)")
+    p.add_argument("--warm_frac", type=float, default=0.5,
+                   help="fraction of restarts to warm-start (rest stay random)")
     args = p.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available()
@@ -179,11 +226,16 @@ def main():
     for f_ghz in args.freqs:
         for d_db in args.depths:
             centers = [ghz_to_bin(f_ghz)]
+            warm = None
+            if args.warm_start and args.data:
+                warm = load_warm_designs(args.data, centers[0], device,
+                                         depth_max=max(d_db, -6.0))
             r = optimize_target(
                 model, norm, centers, device,
                 target_db=d_db, stop_floor_db=args.stop_floor_db,
                 half_pass=args.half_pass, restarts=args.restarts,
                 iters=args.iters, gamma=args.gamma, feed_mask=feed_mask,
+                warm_init=warm, warm_frac=args.warm_frac,
             )
             pm = r["pass_mask"]
             surr_dip = float(r["best_s11_db"][pm].min())
