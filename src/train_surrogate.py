@@ -30,7 +30,7 @@ from torch.utils.data import DataLoader
 import sys
 sys.path.append(os.path.dirname(__file__))
 from data_utils import load_dataset          # noqa: E402
-from model import build_model                # noqa: E402
+# build_model is imported inside run() based on --arch (cnn vs transformer)
 
 
 def pick_device():
@@ -47,7 +47,14 @@ def run(args):
 
     device = pick_device()
     use_amp = device.type == "cuda"
-    print(f"device={device}  amp={use_amp}  seed={args.seed}")
+    print(f"device={device}  amp={use_amp}  seed={args.seed}  arch={args.arch}")
+
+    # Dispatch on --arch. Both modules expose the same build_model(p_drop=...)
+    # signature and produce (N,1,12,12) -> (N,81) tensors in normalized dB space.
+    if args.arch == "transformer":
+        from model_transformer import build_model
+    else:
+        from model import build_model
 
     ds = load_dataset(args.data, seed=args.split_seed)
     norm = ds.normalizer
@@ -123,7 +130,9 @@ def run(args):
 
         ck = {"model": model.state_dict(), "opt": opt.state_dict(),
               "sched": sched.state_dict(), "scaler": scaler.state_dict(),
-              "epoch": epoch, "best_val": best_val, **norm.state()}
+              "epoch": epoch, "best_val": best_val,
+              "arch": args.arch,
+              **norm.state()}
         torch.save(ck, last_path)
         if val_mse < best_val:
             best_val = val_mse
@@ -182,6 +191,8 @@ def get_args():
     p = argparse.ArgumentParser()
     p.add_argument("--data", default="data/antenna_dataset.mat")
     p.add_argument("--ckpt_dir", default="models")
+    p.add_argument("--arch", default="cnn", choices=["cnn", "transformer"],
+                   help="cnn = model.py (default), transformer = model_transformer.py")
     p.add_argument("--epochs", type=int, default=40)
     p.add_argument("--batch", type=int, default=256)
     p.add_argument("--lr", type=float, default=1e-3)

@@ -23,18 +23,29 @@ import torch
 
 sys.path.append(os.path.dirname(__file__))
 from data_utils import Normalizer                      # noqa: E402
-from model import build_model                          # noqa: E402
+# build_model is imported inside load_surrogate based on ck["arch"]
 from projection import anneal_k, relax, apply_feed, project  # noqa: E402
 from loss import spec_loss, binary_penalty, make_masks, ghz_to_bin, bin_to_ghz  # noqa: E402
 
 
 def load_surrogate(ckpt_path, device, dropout=0.1):
-    """Rebuild model + normalizer from a training checkpoint."""
+    """Rebuild model + normalizer from a training checkpoint.
+
+    Dispatches on ck["arch"] so old CNN checkpoints (which have no such key)
+    still load unchanged; they default to arch='cnn'. Transformer checkpoints
+    saved by train_surrogate.py --arch transformer carry arch='transformer'.
+    """
     ck = torch.load(ckpt_path, map_location=device)
+    arch = ck.get("arch", "cnn")
+    if arch == "transformer":
+        from model_transformer import build_model
+    else:
+        from model import build_model
     model = build_model(p_drop=dropout).to(device)
     model.load_state_dict(ck["model"])
     model.eval()
     norm = Normalizer(mu=ck["mu"], sigma=ck["sigma"])
+    print(f"loaded arch={arch} from {ckpt_path}")
     return model, norm
 
 
