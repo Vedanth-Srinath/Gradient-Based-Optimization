@@ -24,16 +24,18 @@ import torch
 sys.path.append(os.path.dirname(__file__))
 from data_utils import Normalizer                      # noqa: E402
 # build_model is imported inside load_surrogate based on ck["arch"]
-from projection import anneal_k, relax, apply_feed, project  # noqa: E402
+from projection import (                                  # noqa: E402
+    anneal_k, anneal_tau, relax, relax_gumbel_st, apply_feed, project,
+)
 from loss import spec_loss, binary_penalty, make_masks, ghz_to_bin, bin_to_ghz  # noqa: E402
 
 
 def load_surrogate(ckpt_path, device, dropout=0.1):
     """Rebuild model + normalizer from a training checkpoint.
 
-    Dispatches on ck["arch"] so old CNN checkpoints (which have no such key)
-    still load unchanged; they default to arch='cnn'. Transformer checkpoints
-    saved by train_surrogate.py --arch transformer carry arch='transformer'.
+    Dispatches on ck["arch"] so old CNN checkpoints (no arch key) still load
+    unchanged; they default to arch='cnn'. Transformer checkpoints saved by
+    train_surrogate.py --arch transformer carry arch='transformer'.
     """
     ck = torch.load(ckpt_path, map_location=device)
     arch = ck.get("arch", "cnn")
@@ -78,7 +80,18 @@ def optimize_target(
     k_min=1.0, k_max=15.0,
     beta_max=2.0, gamma=0.0, trust_K=8,
     feed_mask=None, seed=0, warm_init=None, warm_frac=0.5,
+    relax_mode="tanh", tau_max=1.0, tau_min=0.1,
 ):
+    """GD over pixel logits.
+
+    relax_mode:
+      "tanh"   -> continuous relaxation x = 0.5*(1+tanh(k*theta)), k annealed
+                  1->15; hard project at the end. (Original path.)
+      "gumbel" -> straight-through Gumbel-softmax; surrogate sees hard binary
+                  every iteration; tau annealed tau_max->tau_min. Final
+                  hard-projection is a no-op (design is already binary), so
+                  the projection gap should be ~0 by construction.
+    """
     torch.manual_seed(seed)
     pm_np, sm_np = make_masks(centers, half_pass=half_pass, guard=guard)
     pm = torch.from_numpy(pm_np).to(device)
@@ -106,9 +119,14 @@ def optimize_target(
     opt = torch.optim.Adam([theta], lr=lr)
 
     for step in range(iters):
-        k = anneal_k(step, iters, k_min, k_max)
+        if relax_mode == "gumbel":
+            tau = anneal_tau(step, iters, tau_max, tau_min)
+            x_raw = relax_gumbel_st(theta, tau, hard=True)
+        else:  # "tanh" (default; original path)
+            k = anneal_k(step, iters, k_min, k_max)
+            x_raw = relax(theta, k)
         beta = beta_max * (step / max(iters - 1, 1))   # ramp binary penalty
-        x = apply_feed(relax(theta, k), feed_mask)
+        x = apply_feed(x_raw, feed_mask)
         s11_db = norm.to_db(model(x))
         l_spec, _ = spec_loss(s11_db, pm, sm, target_db, stop_floor_db)
         l_bin = binary_penalty(x)
@@ -121,7 +139,15 @@ def optimize_target(
 
     # ---- evaluate: soft vs projected ----
     with torch.no_grad():
-        x_soft = apply_feed(relax(theta, k_max), feed_mask)
+        if relax_mode == "gumbel":
+            # For final scoring, disable noise: use argmax (deterministic hard).
+            # This makes the "soft" and "projected" numbers coincide by design
+            # (ST-GS's whole point) -- projection gap should be ~0.
+            x_soft = apply_feed(
+                relax_gumbel_st(theta, tau_min, hard=True), feed_mask,
+            )
+        else:
+            x_soft = apply_feed(relax(theta, k_max), feed_mask)
         x_proj = apply_feed(project(x_soft), feed_mask)
 
         soft_db = norm.to_db(model(x_soft))
@@ -215,6 +241,15 @@ def main():
                         "that resonate near the target (needs --data)")
     p.add_argument("--warm_frac", type=float, default=0.5,
                    help="fraction of restarts to warm-start (rest stay random)")
+    p.add_argument("--relax_mode", default="tanh", choices=["tanh", "gumbel"],
+                   help="relaxation used inside GD. tanh = original continuous "
+                        "path + hard projection at end. gumbel = straight-through "
+                        "Gumbel-softmax; surrogate sees hard binary every iter, "
+                        "projection gap should be ~0 by construction.")
+    p.add_argument("--tau_max", type=float, default=1.0,
+                   help="Gumbel-softmax temperature at step 0 (higher = noisier)")
+    p.add_argument("--tau_min", type=float, default=0.1,
+                   help="Gumbel-softmax temperature at last step (lower = sharper)")
     args = p.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available()
@@ -232,7 +267,8 @@ def main():
               "Pass --data for valid results.")
 
     os.makedirs(args.out_dir, exist_ok=True)
-    print(f"\n{'target':>16}  {'surr_dip_dB':>11}  {'proj_gap':>8}  file")
+    print(f"\nrelax_mode={args.relax_mode}")
+    print(f"{'target':>16}  {'surr_dip_dB':>11}  {'proj_gap':>8}  file")
     summary = []
     for f_ghz in args.freqs:
         for d_db in args.depths:
@@ -247,6 +283,8 @@ def main():
                 half_pass=args.half_pass, restarts=args.restarts,
                 iters=args.iters, gamma=args.gamma, feed_mask=feed_mask,
                 warm_init=warm, warm_frac=args.warm_frac,
+                relax_mode=args.relax_mode,
+                tau_max=args.tau_max, tau_min=args.tau_min,
             )
             pm = r["pass_mask"]
             surr_dip = float(r["best_s11_db"][pm].min())

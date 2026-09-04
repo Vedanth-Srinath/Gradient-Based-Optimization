@@ -33,6 +33,65 @@ def relax(theta, k):
     return 0.5 * (1.0 + torch.tanh(k * theta))
 
 
+# -----------------------------------------------------------------------------
+# Straight-Through Gumbel-Softmax relaxation (alternative to tanh + project).
+#
+# Motivation: with the annealed tanh path, GD optimizes continuous pixels in
+# [0,1] and then hard-projects at the end. The surrogate never sees a truly
+# binary design during optimization, and any pixel that converges to ~0.5 gets
+# arbitrarily rounded -- that's the projection gap we've observed (0.16-0.25
+# on the transformer). ST-GS eliminates this: the surrogate sees HARD binary
+# every iteration, and gradients flow as if the design had been continuous.
+#
+# Mechanics per pixel i:
+#   Two Gumbel-noise samples g0, g1 are added to the "off" and "on" logits.
+#   softmax([off_logit, on_logit]/tau) gives a near-one-hot distribution.
+#   The "on" probability is taken as the soft pixel.
+#   Straight-through: forward pass uses hard 0/1, backward uses the soft prob
+#   (achieved via the standard  hard = soft + (hard - soft).detach()  trick).
+#
+# tau annealed high -> low over optimization (analogous to k in the tanh path):
+#   High tau: near-uniform sampling, exploration-heavy, high gradient noise.
+#   Low tau : near-deterministic binary, exploitation-heavy, low noise.
+# -----------------------------------------------------------------------------
+def anneal_tau(step, total, tau_max=1.0, tau_min=0.1):
+    """Linear ramp of Gumbel-softmax temperature from tau_max down to tau_min."""
+    if total <= 1:
+        return tau_min
+    frac = min(max(step / (total - 1), 0.0), 1.0)
+    return tau_max + (tau_min - tau_max) * frac
+
+
+def relax_gumbel_st(theta, tau, hard=True, eps=1e-10):
+    """Straight-through Gumbel-softmax relaxation of a per-pixel Bernoulli.
+
+    theta : (..., 1, H, W) logits. Positive theta -> pixel more likely 1.
+    tau   : softmax temperature (scalar). Lower = closer to argmax.
+    hard  : if True, forward pass returns hard {0,1}; gradient still soft.
+
+    Returns pixels in [0,1] (or {0,1} if hard=True) with same shape as theta.
+    """
+    # Two-class logits: [off_logit, on_logit]. Convention: theta = on - off, so
+    # place theta on "on" and 0 on "off" (equivalent to logit(p) = theta).
+    logits_on = theta
+    logits_off = torch.zeros_like(theta)
+    logits = torch.stack([logits_off, logits_on], dim=-1)   # (..., 2)
+
+    # Gumbel(0,1) noise:  -log(-log(U)) with U ~ Uniform(0,1)
+    u = torch.rand_like(logits).clamp(min=eps, max=1.0 - eps)
+    g = -torch.log(-torch.log(u))
+
+    y_soft = torch.softmax((logits + g) / tau, dim=-1)      # (..., 2)
+    p_on = y_soft[..., 1]                                    # (...,) soft prob of 1
+
+    if not hard:
+        return p_on
+
+    # Straight-through: hard forward, soft backward.
+    p_hard = (p_on > 0.5).to(p_on.dtype)
+    return p_hard + (p_on - p_on.detach())
+
+
 def apply_feed(x, feed_mask):
     """Force feed pixels to 1. feed_mask: bool tensor (H,W) or None."""
     if feed_mask is None:
